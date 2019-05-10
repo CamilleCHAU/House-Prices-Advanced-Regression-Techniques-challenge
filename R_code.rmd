@@ -1,0 +1,371 @@
+---
+title: "1st Assignment"
+author: "Machine Learning II" "- Camille Chauliac"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(plyr)
+library(dplyr)     # To compute the `union` of the levels.
+library(png)       # To include images in this document.
+library(knitr)     # To include images inline in this doc.
+library(moments)   # Skewness
+library(e1071)     # Alternative for Skewness
+library(glmnet)    # Lasso
+library(caret)     # To enable Lasso training with CV.
+library(corrplot)  # correlation plot
+library(elasticnet) #for feature selection
+```
+
+## Introduction
+
+This assignment focuses on applying the Feature Engineering processes and the Evaluation methods that we have learned in previous sessions to solve a practical scenario: Predict the price of houses.
+In particular, we are going to use the experimental scenario proposed by the House Prices Dataset. This dataset includes 79 explanatory variables of residential homes. For more details on the dataset and the competition see <https://www.kaggle.com/c/house-prices-advanced-regression-techniques>.
+
+STEPS:
+1) VISUALIZE & ANALYZE the dataset in order to understand the information that we have. 
+2) CLEAN the dataset to solve the problems it might present.
+3) CREATE new features or MODIFY old features
+4) FEATURE ENGINEERING process to select most representative feature set
+5) RUN MODELS 
+6) PREDICT SalesPrice of testset (regression task)
+
+# Useful Functions
+
+In order to facilitate the evaluation of the impact of the different steps, I am going to place the code for creating a baseline `glm` model in a function. Now I can call it again and again without having to re-write everything. The only thing that changes from one case to another is the dataset that is used to train the model.
+
+```{r message=FALSE, warning=FALSE}
+lm.model <- function(training_dataset, validation_dataset, title) {
+  # Create a training control configuration that applies a 5-fold cross validation
+  train_control_config <- trainControl(method = "repeatedcv", 
+                                       number = 5, 
+                                       repeats = 1,
+                                       returnResamp = "all")
+  
+  # Fit a glm model to the input training data
+  this.model <- train(SalePrice ~ ., 
+                       data = training_dataset, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+  
+  # Prediction
+  this.model.pred <- predict(this.model, validation_dataset)
+  this.model.pred[is.na(this.model.pred)] <- 0 # To avoid null predictions
+  
+  # RMSE of the model
+  thismodel.rmse <- sqrt(mean((this.model.pred - validation_dataset$SalePrice)^2))
+  
+  # Error in terms of the mean deviation between the predicted value and the price of the houses
+  thismodel.price_error <- mean(abs((exp(this.model.pred) -1) - (exp(validation_dataset$SalePrice) -1)))
+
+  # Plot the predicted values against the actual prices of the houses
+  my_data <- as.data.frame(cbind(predicted=(exp(this.model.pred) -1), observed=(exp(validation_dataset$SalePrice) -1)))
+  ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "lm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste(title, 'RMSE: ', format(round(thismodel.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(thismodel.price_error, 0), nsmall=0), 
+                          ' €', sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+}
+```
+
+Function to split a dataset into training and validation.
+```{r}
+splitdf <- function(dataframe) {
+  set.seed(123)
+ 	index <- 1:nrow(dataframe)
+ 	trainindex <- sample(index, trunc(length(index)/1.5))
+ 	trainset <- dataframe[trainindex, ]
+ 	testset <- dataframe[-trainindex, ]
+ 	list(trainset=trainset,testset=testset)
+}
+```
+
+## Data Reading and preparation
+The dataset is offered in two separated documents (training and test), therefore we must read and import them seperately. 
+```{r Load Data}
+train = read.csv("/Users/camillechauliac/Documents/IE - Big data & Business Analytics/TERM 2/MACHINE LEARNING 2/train.csv", stringsAsFactors = FALSE)
+
+test = read.csv("/Users/camillechauliac/Documents/IE - Big data & Business Analytics/TERM 2/MACHINE LEARNING 2/test.csv", stringsAsFactors = FALSE)
+```
+
+To avoid applying the Feature Engineering process two times, we join both datasets (using the `rbind` function), apply your FE and then split the datasets again. However, if we try to do join the two dataframes as they are, we will get an error because  `test_data` does not have a column `SalePrice`. Therefore, we first create this column in the test set and then we join the data
+
+```{r Joinning datasets}
+#creating SalePrice column in testset
+test$SalePrice <- 0
+#merging the two sets of data
+all_data <- rbind(select(train,MSSubClass:SaleCondition),
+                          select(test,MSSubClass:SaleCondition))
+```
+
+Let's now visualize the dataset to see where to begin
+```{r Dataset Visualization}
+summary(all_data)
+```
+Some problems become clear by looking at the summary: missing values, categorical columns codified as numeric, different scales for the feature values. Ofcourse, we'll need to take a deeper look to the data to detect more subtle issues: correlation between features, skewness in the feature values...
+
+This document is based on [Alexandru Papiu](https://www.kaggle.com/apapiu)'s 
+[Jupyter-Notebook Kernel](https://www.kaggle.com/apapiu/house-prices-advanced-regression-techniques/regularized-linear-models). A lot of my inspiration came from his kernel, as I thought he worked very efficiently. 
+Also I tried to not type many lines of code as it is super difficult to maintain a clear and structured R-markdown due to multiple lines of code. After many trials of different ways of coding, I believe this is the most efficient one although I did not follow every step of the walkthrough markdown. The choice was made to not follow the markdown for most of the lines but to see and try for myself how far I would go and how many/which steps I would undertake myself.
+
+# Data Cleaning
+
+## Clearing out the NAs
+Building a predictive model does not work when there are still missing values in the dataset. The most important step in building a model is looking for NA's and handling them.
+Removing the missing values is not always the smartest option because when providing a prediction.
+
+Counting columns with null values.
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(all_data)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(all_data[na.cols], is.na)), decreasing = TRUE)
+```
+
+In any case, what we do here, is simply go through every single **factor** feature to: extend the number of possible levels to the new default for NAs. For numerical values, we can just change the NA value for a default value, the median of the other values or some other value that you can infer. This is good to see how many NA's we had. After first, trying multiple times to remove NA's with some creativity, I found out that deleting the NA's towards the end of my document gave me a better score. Therefore, my first step is Skewness.
+
+### Data preprocessing:
+
+I started out with the skewness.
+
+## Skewness
+We now need to detect skewness in the Target value (SalePrice). We can see what is the effect of skewness on a variable by plotting it using ggplot. The way of getting rid of the skewness is to use the `log` (or the `log1p`) of the values of that feature, to flatten it. To reduce right skewness, take roots or logarithms or reciprocals (x to 1/x). This is the commonest problem in practice. To reduce left skewness, take squares or cubes or higher powers.
+
+```{r In_5,message=FALSE}
+# get data frame of SalePrice and log(SalePrice + 1) for plotting
+df <- rbind(data.frame(version="log(price+1)",x=log(train$SalePrice + 1)),
+            data.frame(version="price",x=train$SalePrice))
+
+# plot histogram
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x))
+```
+
+We therefore transform the target value applying log
+```{r Log transform the target for official scoring}
+# Log transform the target for official scoring
+train$SalePrice <- log(train$SalePrice + 1)
+```
+
+The same "skewness" observed in the target variable also affects other variables. To facilitate the application of the regression model we are going to also eliminate this skewness. For numeric feature with excessive skewness, perform log transformation
+
+I will set up my threshold for the skewness in 0.75. I place that value in that variable to adjust its value in a single place, in case I have to perform multiple tests.
+
+Now, let's compute the skewness of each feature that is not 'factor' nor 'character'. So, I'm only interested in continuous values. One possible way of doing it is the following: First, lets determine what is the 'class' or data type of each of my features.
+```{r}
+# for numeric feature with excessive skewness, perform log transformation
+# first get data type for each feature
+feature_classes <- sapply(names(all_data),function(x){class(all_data[[x]])})
+numeric_feats <-names(feature_classes[feature_classes != "character"])
+```
+
+```{r}
+# determine skew for each numeric feature
+skewed_feats <- sapply(numeric_feats,function(x){skewness(all_data[[x]],na.rm=TRUE)})
+
+# keep only features that exceed a threshold for skewness
+skewed_feats <- skewed_feats[skewed_feats > 0.75]
+
+# transform excessively skewed features with log(x + 1)
+for(x in names(skewed_feats)) {
+  all_data[[x]] <- log(all_data[[x]] + 1)
+}
+```
+
+
+```{r}
+skewness_threshold = 0.75
+```
+
+## Outliers
+Outliers for numerical values can mislead the training of our models resulting in less accurate models and ultimately worse results. We seek to identify those outliers to properly deal with them. Variables which "Max." is much larger than the rest of values are susceptible of containing outliers. 
+
+I decided, after multiple tries of outlier removal, that the best submission was when I let the outliers in the dataset. Therefore I chose to leave the outliers to be.
+
+# Feature Creation
+This is the section to create all the features that you believe might improve the final result. Do not worry if you add some "uninformative" feature because this will be removed by the later feature selection process.
+
+I tried many creations, none of them did work and then I finally found some kernels who also did not creaty any new informative value. Therefore, I went with their solution ("J. Thompson", "LinearRegression and PCA - excluding outliers", .. ) and tried to just change some categorical features into dummy variables.
+
+```{r}
+# get names of categorical features
+categorical_feats <- names(feature_classes[feature_classes == "character"])
+
+# use caret dummyVars function for hot one encoding for categorical features
+dummies <- dummyVars(~.,all_data[categorical_feats])
+categorical_1_hot <- predict(dummies,all_data[categorical_feats])
+categorical_1_hot[is.na(categorical_1_hot)] <- 0  #for any level that was NA, set to zero
+
+```
+
+
+#Missing Values
+Finally, this is the point where we just simply change or replace all missing values for the numeric features with the mean. This might seem as an odd decision sometimes, but gave me better score than with the median. 
+```{r}
+numeric_df <- all_data[numeric_feats]
+
+for (x in numeric_feats) {
+    mean_value <- mean(train[[x]],na.rm = TRUE)
+    all_data[[x]][is.na(all_data[[x]])] <- mean_value
+}
+```
+
+####Combine all data again, and split for training and test set
+```{r}
+# reconstruct all_data with pre-processed data
+all_data <- cbind(all_data[numeric_feats],categorical_1_hot)
+
+# create data for training and test
+X_train <- all_data[1:nrow(train),]
+X_test <- all_data[(nrow(train)+1):nrow(all_data),]
+y <- train$SalePrice
+```
+
+### MODELS
+```{r}
+
+# set up caret model training parameters
+# model specific training parameter
+CARET.TRAIN.CTRL <- trainControl(method="repeatedcv",
+                                 number=5,
+                                 repeats=5,
+                                 verboseIter=FALSE)
+```
+### Ridge Regression
+
+For this exercise, we are going to make use of the <a href="https://cran.r-project.org/web/packages/glmnet/index.html">`glmnet`</a> library. Take a look to the library to fit a glmnet model for Ridge Regression, using a grid of lambda values.
+```{r Ridge Regression, warning=FALSE}
+# test out Ridge regression model
+
+lambdas <- seq(1,0,-0.001)
+
+# train model
+set.seed(123)  # for reproducibility
+model_ridge <- train(x=X_train,y=y,
+                  method="glmnet",
+                  metric="RMSE",
+                  maximize=FALSE,
+                  trControl=CARET.TRAIN.CTRL,
+                  tuneGrid=expand.grid(alpha=0, # Ridge regression
+                                       lambda=lambdas))
+
+```
+The parameter `alpha = 0` means that we want to use the Ridge Regression way of expressing the penalty in regularization. If you replace that by `alpha = 1` then you get Lasso.
+
+#### Evaluation
+
+Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+Small values seem to work better for this dataset.
+
+```{r Ridge RMSE}
+plot(model_ridge)
+```
+
+Plotting the coefficients for different lambda values. As expected the larger the lambda (lower Norm) value the smaller the coefficients of the features. However, as we can see at the top of the features, there is no feature selection; i.e., the model always consider the 225 parameters.
+
+```{r Ridge Coefficients}
+plot(model_ridge$finalModel)
+```
+
+####In [13]
+```{r}
+ggplot(data=filter(model_ridge$result,RMSE<0.14)) +
+    geom_line(aes(x=lambda,y=RMSE))
+
+
+```
+Check the mean of the RMSE to see where you stand with the score
+```{r}
+mean(model_ridge$resample$RMSE)
+```
+
+Rank the variables according to the importance attributed by the model.
+```{r}
+# Print, plot variable importance
+plot(varImp(model_ridge), top = 20) # 20 most important features
+```
+
+### Lasso Regresion
+
+The only thing that changes between Lasso and Ridge is the `alpha` parameter. The remaining part of the exercise is equivalent.
+
+```{r}
+# train model
+set.seed(123)  # for reproducibility
+model_lasso <- train(x=X_train,y=y,
+                  method="glmnet",
+                  metric="RMSE",
+                  maximize=FALSE,
+                  trControl=CARET.TRAIN.CTRL,
+                  tuneGrid=expand.grid(alpha=1,  # Lasso regression
+                                       lambda=c(1,0.1,0.05,0.01,seq(0.009,0.001,-0.001),
+                                            0.00075,0.0005,0.0001)))
+model_lasso
+```
+Again, check the mean of the RMSE of the lasso model to see how far we've come.
+```{r}
+mean(model_lasso$resample$RMSE)
+```
+
+Not every feature is as important for the final model, therefore we should extract the coefficients to find out which is the best performing model. 
+```{r}
+coef <- data.frame(coef.name = dimnames(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda))[[1]], 
+           coef.value = matrix(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda)))
+
+# exclude the (Intercept) term
+coef <- coef[-1,]
+```
+A final summary:
+```{r}
+# print summary of model results
+picked_features <- nrow(filter(coef,coef.value!=0))
+not_picked_features <- nrow(filter(coef,coef.value==0))
+
+cat("Lasso picked",picked_features,"variables and eliminated the other",
+    not_picked_features,"variables\n")
+```
+
+```{r}
+# sort coefficients in ascending order
+coef <- arrange(coef,-coef.value)
+
+# extract the top 10 and bottom 10 features
+imp_coef <- rbind(head(coef,10),
+                  tail(coef,10))
+```
+
+```{r}
+ggplot(imp_coef) +
+    geom_bar(aes(x=reorder(coef.name,coef.value),y=coef.value),
+             stat="identity") +
+    ylim(-1.5,0.6) +
+    coord_flip() +
+    ggtitle("Coefficents in the Lasso Model") +
+    theme(axis.title=element_blank())
+```
+# Final Submission
+
+Based on your analysis, you have to decide which cleaning and feature engineering procedures make sense in order to create your final model.
+We splitted the original training data into train and validation to evaluate the candidate models. In order to generate the final submission we have to take instead all the data at our disposal.
+```{r Final Submission}
+# Predict the prices for the test data (i.e., we use the exp function to revert the log transformation that we applied to the target variable)
+final.pred <- as.numeric(exp(predict(model_lasso, newdata = X_test))-1) 
+final.pred[is.na(final.pred)]
+hist(final.pred, main="Histogram of Predictions", xlab = "Predictions")
+
+lasso_submission <- data.frame(Id=as.integer(rownames(X_test)),SalePrice=final.pred)
+colnames(lasso_submission) <-c("Id", "SalePrice")
+write.csv(lasso_submission, file = "final_one.csv", row.names = FALSE) 
+```
